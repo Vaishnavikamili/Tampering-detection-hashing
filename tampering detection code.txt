@@ -1,0 +1,290 @@
+# =========================================
+# INSTALLS
+# =========================================
+!pip install -q opencv-python-headless pywavelets scikit-image matplotlib
+
+# =========================================
+# IMPORTS
+# =========================================
+import cv2
+import numpy as np
+import pywt
+from skimage.feature import local_binary_pattern
+from scipy.fftpack import dct
+from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import peak_signal_noise_ratio as psnr # Import PSNR
+import matplotlib.pyplot as plt
+from google.colab import files
+import time
+
+# =========================================
+# HELPER: UPLOAD (one-by-one)
+# =========================================
+def upload_two_images():
+    print("👉 Upload the ORIGINAL image")
+    up1 = files.upload()
+    original_name = list(up1.keys())[0]
+
+    print("👉 Upload the TAMPERED image")
+    up2 = files.upload()
+    tampered_name = list(up2.keys())[0]
+    print("✅ Uploaded:", original_name, "and", tampered_name)
+    return original_name, tampered_name
+
+# =========================================
+# IO + PREPROCESS
+# =========================================
+def read_image_resize(path, size=(256, 256), color=True):
+    if color:
+        img = cv2.imread(path, cv2.IMREAD_COLOR)
+    else:
+        img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+
+    if img is None:
+        raise ValueError(f"Could not read image: {path}")
+
+    img = cv2.resize(img, size, interpolation=cv2.INTER_AREA)
+
+    # If reading color, convert to RGB for matplotlib display
+    if color:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+    return img
+
+# =========================================
+# BLIND GEOMETRIC CORRECTION (auto alignment)
+# - Uses ORB + BFMatcher + RANSAC Homography
+# - Warps tampered->original frame
+# =========================================
+def align_to_reference(ref_img, mov_img):
+    # Convert to grayscale for ORB
+    ref_gray = cv2.cvtColor(ref_img, cv2.COLOR_RGB2GRAY) if len(ref_img.shape) == 3 else ref_img
+    mov_gray = cv2.cvtColor(mov_img, cv2.COLOR_RGB2GRAY) if len(mov_img.shape) == 3 else mov_img
+
+
+    # Use higher number of features for tougher cases
+    orb = cv2.ORB_create(nfeatures=4000, scaleFactor=1.2, edgeThreshold=15, patchSize=31)
+    kp1, des1 = orb.detectAndCompute(ref_gray, None)
+    kp2, des2 = orb.detectAndCompute(mov_gray, None)
+
+
+    if des1 is None or des2 is None or len(kp1) < 4 or len(kp2) < 4:
+        # Fallback: return original moving image (no warp)
+        return mov_img, None, 0
+
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    matches = bf.knnMatch(des1, des2, k=2)
+
+    # Lowe's ratio test
+    good = []
+    for m, n in matches:
+        if m.distance < 0.75 * n.distance:
+            good.append(m)
+
+    if len(good) < 8:
+        return mov_img, None, len(good)
+
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in good]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in good]).reshape(-1, 1, 2)
+
+    H, mask = cv2.findHomography(dst_pts, src_pts, cv2.RANSAC, 3.0)
+    if H is None:
+        return mov_img, None, len(good)
+
+    h, w = ref_img.shape[:2] # Get height and width from color image
+    aligned = cv2.warpPerspective(mov_img, H, (w, h), flags=cv2.INTER_LINEAR)
+    inliers = int(mask.sum()) if mask is not None else 0
+    return aligned, H, inliers
+
+# =========================================
+# FEATURE EXTRACTION (LWT-DCT + CS-LBP)
+# =========================================
+def lwt_dct_features(gray):
+    # 2-level LWT (Haar lifting-like via wavedec2)
+    coeffs = pywt.wavedec2(gray, 'haar', level=2)
+    cA2, _LH2, _HL2, _HH2 = coeffs[0], *coeffs[1]
+    # 2D DCT on approximation band
+    d = dct(dct(cA2.T, norm='ortho').T, norm='ortho')
+    # keep low-frequency block (compact, robust)
+    return d[:16, :16].flatten()  # 256 dims
+
+def cslbp_hist(gray, radius=1):
+    n_points = 8 * radius
+    lbp = local_binary_pattern(gray, n_points, radius, method='uniform')
+    hist, _ = np.histogram(lbp.ravel(),
+                           bins=np.arange(0, n_points + 3),
+                           range=(0, n_points + 2),
+                           density=True)
+    return hist  # length = n_points + 2 = 10 for radius=1
+
+def fused_feature(gray):
+    # Normalize for stability
+    g = cv2.GaussianBlur(gray, (3,3), 0)
+    dct_f = lwt_dct_features(g)
+    lbp_f = cslbp_hist(g, radius=1)
+    feat = np.concatenate([dct_f, lbp_f])  # 256 + 10 = 266 dims
+    # z-score normalize for median threshold robustness
+    mu, sd = np.mean(feat), np.std(feat) + 1e-9
+    feat_n = (feat - mu) / sd
+    return feat_n
+
+def vector_to_hash(vec):
+    med = np.median(vec)
+    return (vec > med).astype(np.uint8)
+
+# =========================================
+# GLOBAL HASH + HAMMING
+# =========================================
+def image_hash(gray):
+    vec = fused_feature(gray)
+    return vector_to_hash(vec), vec
+
+def hamming(h1, h2):
+    return float(np.mean(h1 != h2))
+
+# =========================================
+# BLOCK-WISE HASHING FOR LOCALIZATION
+# =========================================
+def blockwise_hash_map(grayA, grayB, block=32, stride=None):
+    """
+    Compute block-wise fused features for both images and return:
+    - distance map (Hamming per block)
+    - binary mask (tamper map) via Otsu on distances
+    """
+    H, W = grayA.shape
+    stride = block if stride is None else stride
+    ys = list(range(0, H - block + 1, stride))
+    xs = list(range(0, W - block + 1, stride))
+    dist_map = np.zeros((len(ys), len(xs)), dtype=np.float32)
+
+    for i, y in enumerate(ys):
+        for j, x in enumerate(xs):
+            A_blk = grayA[y:y+block, x:x+block]
+            B_blk = grayB[y:y+block, x:x+block]
+            hA, _ = image_hash(A_blk)
+            hB, _ = image_hash(B_blk)
+            dist_map[i, j] = hamming(hA, hB)
+
+    # Upsample to image size for visualization
+    heat = cv2.resize(dist_map, (W, H), interpolation=cv2.INTER_NEAREST)
+
+    # Threshold distances to binary mask (Otsu on normalized heat)
+    heat_norm = (heat - heat.min()) / (heat.max() - heat.min() + 1e-9)
+    heat_u8 = (heat_norm * 255).astype(np.uint8)
+    thr, mask = cv2.threshold(heat_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Morphological cleanup
+    kernel = np.ones((5,5), np.uint8)
+    mask_clean = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask_clean = cv2.morphologyEx(mask_clean, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    return dist_map, heat_norm, mask_clean
+
+# =========================================
+# VISUALIZATION HELPERS
+# =========================================
+def overlay_mask_on_image(img_color, mask_u8, alpha=0.45, overlay_color=(0, 255, 0)): # Changed default to green (RGB)
+    overlay = img_color.copy()
+    # Apply the chosen overlay color where mask==255
+    overlay[mask_u8==255] = overlay_color
+    out = cv2.addWeighted(overlay, alpha, img_color, 1-alpha, 0)
+    return out
+
+def show_all(original, tampered, aligned, heat, mask, diff_map=None, overlay=None, ssim_cmap='gray', pixel_diff_map=None):
+    plt.figure(figsize=(16,10))
+    plt.subplot(2,3,1); plt.imshow(original); plt.title("Original"); plt.axis('off') # No cmap for color
+    plt.subplot(2,3,2); plt.imshow(tampered); plt.title("Tampered (input)"); plt.axis('off') # No cmap for color
+    plt.subplot(2,3,3); plt.imshow(aligned); plt.title("Tampered (aligned)"); plt.axis('off') # No cmap for color
+    plt.subplot(2,3,4); plt.imshow(heat, cmap='jet'); plt.title("Block Hamming Heatmap"); plt.colorbar(fraction=0.046, pad=0.04); plt.axis('off')
+    plt.subplot(2,3,5);
+    if overlay is not None:
+        plt.imshow(overlay); plt.title("Tamper Mask Overlay"); plt.axis('off')
+    else:
+        plt.imshow(mask, cmap='gray'); plt.title("Tamper Mask"); plt.axis('off')
+
+    # Use the 6th subplot for either SSIM difference or Pixel difference
+    if pixel_diff_map is not None:
+        plt.subplot(2,3,6); plt.imshow(pixel_diff_map, cmap='gray'); plt.title("Pixel Difference Map"); plt.axis('off') # Default to gray for pixel diff
+    elif diff_map is not None:
+        plt.subplot(2,3,6); plt.imshow(diff_map, cmap=ssim_cmap); plt.title("SSIM Difference Map"); plt.axis('off')
+
+
+    plt.tight_layout()
+    plt.show()
+
+# =========================================
+# MAIN PIPELINE
+# =========================================
+def run_pipeline(overlay_alpha=0.45, ssim_cmap='gray', overlay_color=(0, 255, 0)): # Added overlay_color parameter
+    # 1) Upload + read (now reads in color by default)
+    pathA, pathB = upload_two_images()
+    A_color = read_image_resize(pathA, (256,256), color=True)
+    B_color = read_image_resize(pathB, (256,256), color=True)
+
+    # Convert to grayscale for processing steps that require it
+    A_gray = cv2.cvtColor(A_color, cv2.COLOR_RGB2GRAY)
+    B_gray = cv2.cvtColor(B_color, cv2.COLOR_RGB2GRAY)
+
+
+    # 2) Blind geometric correction (align B to A)
+    B_aligned_color, H, inliers = align_to_reference(A_color, B_color)
+    print(f"🧭 Alignment: inliers={inliers}, homography={'OK' if H is not None else 'FAILED'}")
+    B_aligned_gray = cv2.cvtColor(B_aligned_color, cv2.COLOR_RGB2GRAY)
+
+
+    # 3) Global hash comparison (robustness check)
+    hA, vA = image_hash(A_gray)
+    hB, vB = image_hash(B_aligned_gray)
+    print(f"Hash length of original image: {len(hA)}")
+    print(f"Hash length of tampered image: {len(hB)}")
+    global_hd = hamming(hA, hB)
+    print(f"🔑 Global Hamming Distance: {global_hd:.4f}  (higher → more different)")
+
+    # 4) SSIM and PSNR for sanity/visualization
+    # SSIM and PSNR are calculated on grayscale images
+    ssim_score, ssim_diff = ssim(A_gray, B_aligned_gray, full=True)
+    psnr_score = psnr(A_gray, B_aligned_gray) # Calculate PSNR
+    print(f"📊 SSIM (Original vs Aligned Tampered): {ssim_score:.4f}  (lower → more tampered)")
+    print(f"📊 PSNR (Original vs Aligned Tampered): {psnr_score:.4f}  (higher → less noise/difference)")
+
+    # Calculate pixel-wise absolute difference
+    pixel_diff = cv2.absdiff(A_gray, B_aligned_gray)
+
+
+    # 5) Block-wise localization
+    dist_map, heat_norm, mask = blockwise_hash_map(A_gray, B_aligned_gray, block=32, stride=32)
+
+    # 6) Overlay for presentation
+    overlay = overlay_mask_on_image(A_color, mask, alpha=overlay_alpha, overlay_color=overlay_color) # Pass overlay_color
+
+    # 7) Plots
+    show_all(A_color, B_color, B_aligned_color, heat_norm, mask, diff_map=ssim_diff, overlay=overlay, ssim_cmap=ssim_cmap, pixel_diff_map=pixel_diff)
+
+    # 8) Print quick guidance
+    tamper_ratio = (mask>0).sum() / mask.size
+    print(f"🧩 Tampered area (approx): {tamper_ratio*100:.2f}% of image")
+    # Interpretation of results:
+    # - Global Hamming Distance: Measures the overall difference between the hashes of the original and aligned tampered images. A higher value suggests more difference, potentially due to tampering.
+    # - SSIM (Structural Similarity Index): Measures the perceptual similarity between the two images. A lower value indicates less similarity, which could be due to tampering.
+    # - PSNR (Peak Signal-to-Noise Ratio): Measures the ratio of the maximum possible power of a signal to the power of corrupting noise that affects the fidelity of its representation. Higher PSNR generally indicates a higher quality image or, in this context, less difference between the original and aligned tampered image.
+    # - Tamper Mask: The binary mask visually highlights areas where the block-wise Hamming distance is high, indicating potential localized tampering.
+    # - Pixel Difference Map: Shows the absolute difference in pixel values between the original and aligned tampered images, highlighting areas of direct pixel changes.
+    if ssim_score < 0.95 or global_hd > 0.08:
+        print("✅ Likely tampering detected (based on hash distance and SSIM).")
+    else:
+        print("ℹ No strong evidence of tampering; images appear globally similar.")
+
+
+# =========================================
+# RUN
+# =========================================
+# Adjust the overlay_alpha parameter (0.0 to 1.0) to change transparency.
+# Lower values mean more transparency.
+# Adjust the ssim_cmap parameter to change the colormap of the SSIM difference map.
+# Examples: 'gray', 'viridis', 'jet', 'inferno'
+# Adjust the overlay_color parameter as an RGB tuple (e.g., (255, 0, 0) for red, (0, 255, 0) for green, (0, 0, 255) for blue)
+# To show the pixel difference map instead of the SSIM difference map, you can set ssim_cmap=None.
+run_pipeline(overlay_alpha=0.45, ssim_cmap=None, overlay_color=(0, 255, 0)) # Defaulted to green
+
+end_time = time.time()
+print(f"\n⏱️ Execution time: {end_time - start_time:.4f} seconds")
